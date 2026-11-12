@@ -156,6 +156,8 @@ def t_fetch(tmp: str) -> None:
     c4 = _Fake(tracks, [], ai_url="", cache_dir=tmp)
     r4 = c4.fetch("BVempty", cid=9, aid=1)
     check("body 为空时不报错、判失败", r4["available"] is False and r4["reason"] == "fetch_failed", str(r4))
+    check("失败前恰好尝试三次", len([c for c in c4.calls if c[0] == "tracks"]) == 3, str(c4.calls))
+    check("失败结果记录尝试次数", r4.get("attempts") == 3, str(r4.get("attempts")))
 
     # ---- 覆盖度校验：字幕只覆盖视频开头一小段时必须弃用 ----
     # 真实案例：BV1hbM9zrEwD P02 是 3680 秒，B站返回的字幕只到 298 秒，
@@ -235,9 +237,167 @@ def t_parse_pages() -> None:
     check("笔记目录名补零到两位", E.note_dir_name("BV1abc", 12) == "BV1abc_P12")
 
 
+def t_whisper_consent() -> None:
+    """没有用户授权时，字幕失败不能自行启动 Whisper。"""
+    print("\n[6b] Whisper 需要显式授权")
+    import extract_bilibili as E  # noqa: PLC0415
+    from src import bili_notes as N  # noqa: PLC0415
+
+    class NoSubtitle:
+        has_login = False
+
+        @staticmethod
+        def fetch(*_args, **_kwargs):
+            return {"available": False, "reason": "fetch_failed", "message": "三次尝试均失败"}
+
+    called = {"count": 0}
+    original = N.transcribe_local
+
+    def fake_transcribe(*_args, **_kwargs):
+        called["count"] += 1
+        return {"source": "whisper", "segments": [{"from": 0, "to": 1, "text": "不应调用"}],
+                "chars": 4, "cost": 0}
+
+    N.transcribe_local = fake_transcribe
+    try:
+        blocked = False
+        try:
+            N.get_transcript(NoSubtitle(), "BVtest", 111, 600)
+        except PermissionError as e:
+            blocked = "授权" in str(e)
+    finally:
+        N.transcribe_local = original
+
+    check("默认不启动 Whisper", called["count"] == 0, str(called))
+    check("返回明确的授权提示", blocked)
+
+    extract_parser = getattr(E, "build_parser", lambda: None)()
+    notes_parser = getattr(N, "build_parser", lambda: None)()
+    extract_default = extract_parser.parse_args(["BVtest"]) if extract_parser else None
+    extract_allowed = (
+        extract_parser.parse_args(["BVtest", "--allow-whisper"]) if extract_parser else None
+    )
+    notes_default = notes_parser.parse_args(["BVtest"]) if notes_parser else None
+    notes_allowed = (
+        notes_parser.parse_args(["BVtest", "--allow-whisper"]) if notes_parser else None
+    )
+    check("extract 默认拒绝 Whisper",
+          extract_default is not None and extract_default.allow_whisper is False)
+    check("extract 显式授权后允许 Whisper",
+          extract_allowed is not None and extract_allowed.allow_whisper is True)
+    check("bili_notes 默认拒绝 Whisper",
+          notes_default is not None and notes_default.allow_whisper is False)
+    check("bili_notes 显式授权后允许 Whisper",
+          notes_allowed is not None and notes_allowed.allow_whisper is True)
+    for name, parser in (("extract", extract_parser), ("bili_notes", notes_parser)):
+        rejected = False
+        try:
+            parser.parse_args(["BVtest", "--allow-whisper", "--no-whisper"])
+        except SystemExit:
+            rejected = True
+        check(f"{name} 拒绝互相冲突的转写开关", rejected)
+
+
+def t_background_consent() -> None:
+    """混合批次先完成成功分P，再把失败分P留到用户授权之后。"""
+    print("\n[6c] 后台先完成可做项，Whisper 前停下来")
+    import argparse  # noqa: PLC0415
+
+    import extract_bilibili as E  # noqa: PLC0415
+    from src import bili_notes as N  # noqa: PLC0415
+
+    class FakeClient:
+        has_login = True
+
+        @staticmethod
+        def get_view(_bvid):
+            return {
+                "bvid": "BVtest",
+                "aid": 1,
+                "title": "测试视频",
+                "owner": "测试UP",
+                "pubdate": 0,
+                "duration": 1200,
+                "desc": "",
+                "stat": {"view": 10, "like": 10, "coin": 0, "favorite": 0},
+                "charge_exclusive": False,
+                "pages": [
+                    {"page": 1, "part": "P1", "cid": 101, "duration": 600},
+                    {"page": 2, "part": "P2", "cid": 102, "duration": 600},
+                ],
+            }
+
+        @staticmethod
+        def list_tracks(_aid, _cid, _bvid="", raise_on_error=False):
+            return [{"lan": "ai-zh", "lan_doc": "中文（自动生成）", "subtitle_url": ""}]
+
+        @staticmethod
+        def fetch(_bvid, cid=0, **_kwargs):
+            if cid == 101:
+                return {
+                    "available": True,
+                    "kind": "ai",
+                    "lang_doc": "中文（自动生成）",
+                    "text": "成功的字幕",
+                    "srt": "",
+                    "chars": 5,
+                    "cached": False,
+                    "attempts": 1,
+                }
+            return {
+                "available": False,
+                "reason": "fetch_failed",
+                "attempts": 3,
+                "message": "连续三次失败",
+            }
+
+    args = argparse.Namespace(
+        probe=False, prefer_subtitle=True, pages="", probe_workers=1,
+        lang="zh", force=False, verify_summary=True, allow_whisper=False,
+        no_whisper=False, require_subtitle=False, workers=1, model="small",
+        skip_existing=False, quality=64, frames=1, cols=5,
+        ignore_like_filter=False,
+    )
+
+    original_build = N.build_note
+    original_out = E.OUT_DIR
+    build_calls = []
+    audio_calls = {"count": 0}
+    N.build_note = lambda _ns, page: (
+        build_calls.append(page) or {"frames": 1, "chapters": 1}
+    )
+    try:
+        import bilibili_client as BC  # noqa: PLC0415
+
+        original_download = BC.download_audio
+        BC.download_audio = lambda *_a, **_k: (
+            audio_calls.__setitem__("count", audio_calls["count"] + 1)
+            or (_ for _ in ()).throw(RuntimeError("不应下载音频"))
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            E.OUT_DIR = tmp
+            summary = E.process("BVtest", FakeClient(), args, login_ok=True)
+    finally:
+        N.build_note = original_build
+        E.OUT_DIR = original_out
+        if "original_download" in locals():
+            BC.download_audio = original_download
+
+    pending = summary.get("pending_whisper") or []
+    check("成功分P先完成素材生成", build_calls == [1], str(build_calls))
+    check("授权前不下载音频", audio_calls["count"] == 0, str(audio_calls))
+    check("整体状态为等待用户授权",
+          summary.get("status") == "needs_whisper_consent", str(summary.get("status")))
+    check("待授权分P和三次尝试被记录",
+          len(pending) == 1 and pending[0].get("page") == 2
+          and pending[0].get("attempts") == 3, str(pending))
+
+
 def t_live(bvid: str) -> None:
     print(f"\n[7] 真实网络探测 {bvid}")
-    c = B.BiliSubtitleClient.from_env(os.path.join(BASE, ".env"))
+    from src.bilibili_client import _sub_client  # noqa: PLC0415
+
+    c = _sub_client()
     ok, who = c.login_check()
     print(f"  登录态: {'✓' if ok else '✗'} {who}")
     v = c.get_view(bvid)
@@ -346,6 +506,22 @@ def t_auth(tmp: str) -> None:
     check("wipe 不清除待注销记录", os.path.exists(A.PENDING_REVOKE_FILE))
     A._shred(A.PENDING_REVOKE_FILE)
 
+    env_result = A.resolve_credentials(
+        env_file=os.path.join(tmp, ".env"), login="env", verbose=False
+    )
+    check("长期 Cookie 登录入口已移除",
+          "已移除" in str(env_result.get("error", "")), str(env_result.get("error")))
+
+    sys.path.insert(0, os.path.join(BASE, "tools"))
+    import safe_delete as SD  # noqa: PLC0415
+
+    import inspect  # noqa: PLC0415
+
+    check("安全删除路径不含硬编码用户名",
+          "32352" not in inspect.getsource(SD), "safe_delete.py 源码含个人用户名")
+    check("家目录仍被安全删除拦截",
+          "命中保护清单" in SD.check(os.path.expanduser("~")), SD.check(os.path.expanduser("~")))
+
     # 凭证注入到 requests 会话
     c = B.BiliSubtitleClient()
     c.apply_credentials(creds)
@@ -412,6 +588,8 @@ def main() -> int:
         t_fetch(tmp)
     with tempfile.TemporaryDirectory() as tmp:
         t_auth(tmp)
+    t_whisper_consent()
+    t_background_consent()
     t_parse_pages()
     t_zh()
     if "--audio" in sys.argv:

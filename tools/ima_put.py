@@ -4,11 +4,10 @@ MCP 的 create_media 只登记元数据并返回一份临时 COS 凭据，
 文件本体要自己用 COS SDK 传到 cos_key 指定的位置，之后 add_knowledge 才会入库。
 这个脚本就是中间那一步，从 stdin 读 JSON：
 
-    {"file": "本地路径", "key": "cos_key", "cred": {
-        "secret_id": "...", "secret_key": "...", "token": "...",
-        "region": "ap-shanghai", "bucket_name": "ima-share-kb-1258344701"}}
+    {"file": "本地路径", "key": "cos_key", "cred": <MCP 返回的临时凭证对象>}
 
-凭据故意走 stdin 而不是命令行参数，避免落在 shell history 里。
+凭据对象原样传给 stdin，不打印、不落盘、不写入命令行参数，
+避免出现在聊天记录、日志和 shell history 里。
 """
 from __future__ import annotations
 

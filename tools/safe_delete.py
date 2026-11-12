@@ -42,23 +42,35 @@ import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LOG = os.path.join(ROOT, "logs", "safe-delete.log")
+USER_HOME = os.path.abspath(os.path.expanduser("~"))
+USER_PARENT = os.path.dirname(USER_HOME)
+
+
+def _env_path(name: str, fallback: str) -> str:
+    return os.path.abspath(os.environ.get(name) or fallback)
 
 # 类型一：整棵树都禁止（系统盘的关键目录，内部任何东西都不许删）
 FORBIDDEN_TREES = [
-    r"C:\Windows", r"C:\Program Files", r"C:\Program Files (x86)",
-    r"C:\ProgramData", r"C:\Users\32352\AppData",
+    _env_path("SystemRoot", r"C:\Windows"),
+    _env_path("ProgramFiles", r"C:\Program Files"),
+    _env_path("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+    _env_path("ProgramData", r"C:\ProgramData"),
+    _env_path("APPDATA", os.path.join(USER_HOME, "AppData", "Roaming")),
+    _env_path("LOCALAPPDATA", os.path.join(USER_HOME, "AppData", "Local")),
 ]
 
 # 类型二：只禁止「这个路径本身」（可以删它里面的具体文件，但不能整个端走）
 FORBIDDEN_SELF = [
-    r"C:\\", r"C:\Users",
-    r"C:\Users\32352",                    # 家目录本身
-    r"C:\Users\32352\Desktop",
-    r"C:\Users\32352\Documents",
-    r"C:\Users\32352\Downloads",
-    r"C:\Users\32352\Pictures",
-    r"C:\Users\32352\Music",
-    r"C:\Users\32352\Videos",
+    os.path.abspath(os.sep),               # 当前盘根 / 文件系统根
+    USER_PARENT,                           # 用户目录的上一级
+    USER_HOME,                             # 家目录本身
+    os.path.join(USER_HOME, "AppData"),
+    os.path.join(USER_HOME, "Desktop"),
+    os.path.join(USER_HOME, "Documents"),
+    os.path.join(USER_HOME, "Downloads"),
+    os.path.join(USER_HOME, "Pictures"),
+    os.path.join(USER_HOME, "Music"),
+    os.path.join(USER_HOME, "Videos"),
     ROOT,                                 # 项目根
     os.path.join(ROOT, ".git"),           # 版本历史
     os.path.join(ROOT, "models"),         # 模型重下代价大

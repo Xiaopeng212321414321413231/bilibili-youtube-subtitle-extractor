@@ -1,6 +1,6 @@
 ---
 name: bilibili-extract
-description: 提取 B站视频并做成图文笔记。当用户提供 B站链接、BV号、合集或搜索关键词，要求提取/转写/总结视频内容、生成图文笔记、导入知识库（IMA 等）时使用。手机扫码登录拿一次性会话（用完自动注销焚毁）。产物固定为「画面 + 文字」：下载原视频按章节抽帧 + 字幕（官方CC/B站AI字幕，拿不到才降级 faster-whisper 本地转写），抽帧不可跳过、没有只出文本的模式；支持多P批量、字幕预探测与三层防串台校验、点赞 <5 自动跳过。**一期一个 HTML、逐篇投递知识库**（图 base64 内嵌不断链），**不做合并**；含 28 讲合集拆成单篇的完整实战范例。
+description: 提取 B站视频并做成图文笔记。当用户提供 B站链接、BV号、合集或搜索关键词，要求提取/转写/总结视频内容、生成图文笔记、导入知识库（IMA 等）时使用。手机扫码登录拿一次性会话（用完自动注销焚毁）。产物固定为「画面 + 文字」：下载原视频按章节抽帧 + 字幕（官方CC/B站AI字幕均可自动提取，连续三次失败后必须询问用户是否使用 faster-whisper），抽帧不可跳过、没有只出文本的模式；支持多P批量、字幕预探测与三层防串台校验、点赞 <5 自动跳过。**一期一个 HTML、逐篇投递知识库**（图 base64 内嵌不断链），**不做合并**；含 28 讲合集拆成单篇的完整实战范例。
 ---
 
 # bilibili-extract · 视频 → 图文笔记
@@ -21,15 +21,15 @@ description: 提取 B站视频并做成图文笔记。当用户提供 B站链接
 
 把 B站视频（单视频 / 多P / 合集）转成文本，供知识卡片化、笔记归档使用。
 
-两条铁律：
+三条铁律：
 1. **能手拿字幕就不下载音频。**
-2. **不长期保存 Cookie** —— 扫码拿一次性会话，任务结束就注销焚毁。
+2. **Whisper 必须先问用户** —— 官方 CC / B站 AI 字幕完整尝试三次；仍失败就停下来征求授权，不能自行转写。
+3. **不长期保存 Cookie** —— 只走手机扫码的一次性会话，任务结束就注销焚毁；不读取 `.env` 长期 Cookie。
 
 ## 工具位置
 
-```
-C:\Users\32352\Desktop\ai软件\git\bilibili-subtitle-extractor
-```
+仓库根目录记为 `<repo-root>`。先在实际工作目录执行 `git rev-parse --show-toplevel`
+确认位置，不要把某个人的本机绝对路径写进日志或交付物。
 
 | 文件 | 作用 |
 |---|---|
@@ -50,20 +50,20 @@ C:\Users\32352\Desktop\ai软件\git\bilibili-subtitle-extractor
 | `tools/verify_merge.py` | ⚠️ 同上，合并后做四维校验用 |
 | `src/bilibili_client.py` | 元信息 / 音频下载；`get_subtitles()` 委托 `bili_subtitle` |
 | `src/zh_convert.py` | 繁→简转换（opencc 优先，内置 392 字兜底；不用 zhconv，它是 GPL） |
-| `selftest_subtitle.py` | 自检（75 项，离线可跑） |
+| `selftest_subtitle.py` | 自检（92 项，离线可跑） |
 | `notes/<BV>_P<nn>/` | **主产物**：`transcript.md` / `frames.json` / `frames/` / `contacts/` / `meta.json` |
 | `extracted/` | 运行记录：`<BV>.json`（每P状态/来源/字数/帧数）|
 | `assets/video/` `assets/frames/` | 视频流与帧缓存（按 `<BV>_<cid>` 命名，重跑不重复下载） |
 | `extracted/.subcache/` | 字幕缓存，重跑 0 请求 |
 
-Python：`C:\Program Files\Python312\python.exe`（`-m src.bili_notes` 需在上述仓库根目录下执行）
+Python：优先使用仓库自己的 `.venv`；`-m src.bili_notes` 需在仓库根目录下执行。
 
 ## 认证：扫码登录，用完即焚
 
 B站 AI 字幕**必须登录**才下发。不要手抄 SESSDATA（长期凭证、明文落盘、容易忘记删），走扫码：
 
 ```bash
-cd "C:\Users\32352\Desktop\ai软件\git\bilibili-subtitle-extractor"
+cd "<repo-root>"
 
 # ① 生成二维码（图落到临时目录）
 python src/bili_auth.py login --no-wait --qr-out "%TEMP%\bili_ephemeral\qr.png"
@@ -106,10 +106,17 @@ python src/bili_auth.py status          # 查看当前会话（只显示状态�
 | 单次提取 | `login --no-wait` → present_files 展示二维码 → `wait` → 再跑 extract |
 | 用户说「扫好了」 | 直接 `wait`（沿用上次二维码，未过期时很快出结果） |
 | 批量多轮 | 加 `--keep-session` 复用同一会话，全部跑完再 `--logout` |
-| 无人值守 / 定时任务 | 只能用 `--login env`（`.env` 长期 Cookie），安全性差，需用户明确同意 |
+| 无人值守 / 定时任务 | 不支持长期 Cookie。需要登录时停下并请用户扫码；不得为省一步而把 Cookie 写进 `.env` |
 
-`--login` 取值：`auto`（会话→.env→扫码，默认）、`session`、`env`、`qr`、`none`。
+`--login` 取值：`auto`（一次性会话→扫码，默认）、`session`、`qr`、`none`。
 默认行为：**跑完自动注销 + 焚毁**；`--keep-session` 保留。
+
+**隐私规则（硬规则）**
+
+- 不把 SESSDATA、bili_jct、DedeUserID、COS 临时密钥写进 `.env`、日志、笔记或聊天。
+- `status` 只显示是否有凭证和剩余 TTL，永不打印凭证值。
+- 二维码只用于本次扫码；任务结束或 TTL 到期后覆写删除。
+- 如果后台任务正在等待 Whisper 授权，一次性会话可暂留到用户答复或 TTL 到期；不得延长成长期凭证。
 
 ## 标准流程
 
@@ -125,19 +132,21 @@ P02 | B站AI字幕(中文（自动生成）)   |  13:32 | 二、组队分工与�
 P05 | 无字幕                        |  12:45 | 五、问卷与抽样设计
 ```
 
-看到这张表就知道要花多久：有字幕的分P 秒级完成，无字幕的才进转写。
+看到这张表就能知道哪些分P可直接完成。真正提取时仍会对每个目标分P做完整尝试；
+字幕三次失败后只进入“等待 Whisper 授权”，不会自动转写。
 
 ### 2. 提取（唯一模式：图文素材）
 
 ```bash
-# 默认：字幕 → 分章 → 下载原视频抽帧 → 素材包（抽帧不可跳过）
+# 默认：官方CC/B站AI字幕各自动尝试 → 分章 → 下载原视频抽帧 → 素材包
+# 字幕连续三次失败时只记录待授权状态，不会自行启动 Whisper
 python extract_bilibili.py BV1xxxxxxx
 
 # 每章多取几帧 / 更高清晰度
 python extract_bilibili.py BV1xxxxxxx --frames 8 --quality 80
 
-# 无字幕就跳过（不转写）
-python extract_bilibili.py BV1xxxxxxx --no-whisper
+# 只能在用户明确同意 Whisper 后加：字幕三次失败才转写
+python extract_bilibili.py BV1xxxxxxx --allow-whisper
 
 # 任一分P无字幕就中止，避免误跑几小时转写
 python extract_bilibili.py BV1xxxxxxx --require-subtitle
@@ -151,6 +160,21 @@ python extract_bilibili.py BV1xx BV2yy BV3zz
 
 **必须后台运行**（`run_in_background: true`）。有字幕的批次，光是字幕阶段几秒到几十秒；
 但**抽帧要下原视频**，一个 1 小时的分P约 1.5–3 分钟（1080P 下载 + 按章取帧）。
+
+#### 后台任务契约：先把能做的做完，再休眠
+
+这是硬规则，不是建议。后台启动时默认**不加** `--allow-whisper`：
+
+1. 所有目标分P都自动尝试字幕：官方 CC 与 B站 AI 字幕都可以取，按现有优先级选择。
+2. 每个失败分P完整尝试三次，每次重查轨道并重新取内容；不能只试一次就停。
+3. 成功分P继续完成分章、下载视频、抽帧、联系表与素材落盘；不要因为别的分P等待授权而停工。
+4. 失败分P写入 `extracted/<BV>.json`：`status=needs_whisper_consent`，
+   `pending_whisper[]` 记录分P号、失败原因和 `attempts=3`。
+5. 已完成分P的临时产物按现有规则清理；此时才结束后台工作并休眠。
+6. 最后向用户报告“成功的有哪些、失败的是哪些、为什么失败”，并明确询问是否允许 Whisper。
+
+用户回答“允许”之后，才用 `--allow-whisper` 续跑失败分P。用户拒绝或未回答时，
+只能交付已完成部分，不能偷偷转写。
 
 ### 3. 读结果
 
@@ -191,30 +215,33 @@ python tools/cleanup.py --all --yes     # 确认后清（进回收站，可恢�
 | 元信息 | `x/web-interface/view` 拿 aid/cid/pages/stat |
 | 字幕轨道 | `x/player/v2?cid=&bvid=`（**老接口优先，最稳**）；空则试 WBI 版 |
 | AI 字幕取址 | 新版 AI 轨道 `subtitle_url` 为空，须再请求 `x/player/v2/ai/subtitle/search/stat?aid=&cid=` |
-| 轨道优选 | 中文人工 > 中文AI > 其他人工 > 其他AI |
+| 轨道优选 | 中文人工 > 中文AI > 其他人工 > 其他AI；两种来源都可由 Agent 自动提取 |
 | 字幕内容 | 下载 `subtitle_url` 的 JSON，取 `body[].from/to/content` |
-| **覆盖度校验** | 末段 `to` / 分P时长必须落在 **0.70 ~ 1.20**。低于 = 只覆盖开头，高于 = 拿到别的（更长的）视频的字幕。越界则换轨道重试，全部越界再**重查一次轨道**（B站 偶发串台，重查通常就对），仍不行则**不写缓存**并回落转写 |
+| **覆盖度校验** | 末段 `to` / 分P时长必须落在 **0.70 ~ 1.20**。低于 = 只覆盖开头，高于 = 拿到别的（更长的）视频的字幕。越界则换轨道重试；整轮失败后重查轨道，总计恰好三次。仍失败则**不写缓存**并返回待授权状态 |
 | **内容交叉校验** | 拿 `x/web-interface/view/conclusion/get`（该视频自己的 AI 总结，WBI 签名免登录）与字幕正文算词汇重合度（英文词 + 中文二元组，短边做分母），**< 0.12 判定串台**。这一层专门抓「长度恰好相仿、覆盖度查不出」的错字幕（实测：正确 0.35/0.38，串台 0.04）。可用 `--no-verify` 关闭 |
 | 缓存 | `extracted/.subcache/<BV>_<cid>.json`，同分P第二次 0 请求；读到坏缓存（覆盖不足）当场删除重取 |
 | 并发 | 探测/抓取默认 4 线程；转写才用多进程 |
 
 旧版 `info["subtitle"]["list"]` 基本恒空 —— 这是过去「明明有字幕却走了转写」的根因。
 
-## 转写降级（仅当确实无字幕）
+## 转写授权（仅当三次字幕失败且用户明确同意）
 
-- **AI 字幕提取失败自动退避重试（2026-10-31）**：提取失败 → 等 1.5s → 重查
-  轨道重试 → 再失败 → 等 3s → 再试 → 仍失败才走 whisper（用户指定的节奏）。
-  覆盖度/内容校验不过同样走这个重试，不做区分——重查轨道后内容可能就对了。
+- **字幕恰好尝试三次**：第一次失败 → 等 1.5s → 第二次完整重查轨道和内容 →
+  再失败 → 等 3s → 第三次。覆盖度/内容校验不过同样计入，不做区分。
+- **三次后先问用户**：默认命令只写 `needs_whisper_consent` 并停下，
+  不下载音频、不启动 Whisper。用户明确同意后才加 `--allow-whisper`。
 - **音频下载**：`x/player/playurl?fnval=16` 取 DASH 音频流（选 `bandwidth` 最高），
   `baseUrl` + `backupUrl` 多源冗余，流式存 `.m4a`（先写 `.part` 再 `os.replace`）。
   **不需要 yt-dlp**（依赖清单里已移除，别再加回来）。早期版本借用 `bilibili-api` 的
   `get_download_url`，但它自带网络栈、无视系统代理，代理环境下必挂，已改成用本模块 session。
-- **凭证**：下载音频用「一次性扫码会话」优先，`.env` 长期 Cookie 兜底——扫码登录、`.env` 为空也能转写
+- **凭证**：下载音频只使用「一次性扫码会话」；不读取 `.env` 长期 Cookie
 - **串行下载音频**：bilivideo.com CDN 对并发下载限流（SSL UNEXPECTED_EOF），必须逐个来
 - **并行转写**：`--workers N` 走多进程；若环境不支持 spawn（会 BrokenProcessPool），自动退回串行，不会整批失败
 - **输出简体**：whisper 对中文默认吐繁体，已统一转简体（`zhconv`，缺失时用内置表兜底）
 - 模型缓存：`models/`（首次运行自动下载约 460MB，已配 hf-mirror）
 - 长视频（>10min）不要用百度短语音 API，一律本地 whisper
+- `--force-whisper` 代表跳过字幕直接转写。只有用户明确要求“强制用 Whisper”时才可使用；
+  不能由 Agent 自作主张把它当成普通兜底开关。
 - 离线验证转写链路（不联网）：`python selftest_subtitle.py --audio 任意音频.m4a`
 
 ## 过滤规则（用户硬性要求）
@@ -226,7 +253,7 @@ python tools/cleanup.py --all --yes     # 确认后清（进回收站，可恢�
 ## 转知识卡片
 
 - 读正文 → 按主题归纳（忠于原意，不添料）
-- 无字幕课程合集：先出「课程地图」卡片交付大纲，再按章节优先级转写
+- 无字幕课程合集：先出「课程地图」卡片交付已完成部分的大纲；Whisper 必须在用户同意后再跑
 - 卡片归档到对应学科文件夹，每张卡片一个 md + frontmatter
 - 来源标注：`B站视频 <BV号>（UP主：xxx，赞：xx，来源：AI字幕/机器转写）`
 
@@ -254,7 +281,7 @@ python extract_bilibili.py BV1hbM9zrEwD --pages 1-17 --frames 5 --quality 80
 # 等价写法（参数一一对应）
 python -m src.bili_notes BV1hbM9zrEwD --page 2
 python -m src.bili_notes <url> --chapters notes/xxx_chapters.json --frames 8   # 用人工章节
-python -m src.bili_notes BV1hbM9zrEwD --page 2 --no-whisper                    # 无字幕直接报错
+python -m src.bili_notes BV1hbM9zrEwD --page 2                                  # 三次失败后停下等授权
 
 # 只要画面（本地视频或直接给 BV）
 python -m src.bili_frames download BV1hbM9zrEwD --page 2 --quality 64
@@ -264,7 +291,7 @@ python -m src.bili_frames grab <BV号> --page 2 --even 8 --frames 6
 
 | 环节 | 做法 |
 |---|---|
-| 文本 | `BiliSubtitleClient.fetch()`：带覆盖度 + 内容亲和度双重校验、命中缓存 0 请求；不可用且未禁用才走 whisper |
+| 文本 | `BiliSubtitleClient.fetch()`：带覆盖度 + 内容亲和度双重校验、命中缓存 0 请求；三次失败后只等待用户授权 |
 | 分章 | **纯统计不调模型**：相邻话语块的词汇衔接（中文二元组+英文词余弦）掉到局部极小处切，块首是「接下来/总结…」等话语标记时加分，再把边界吸附到片段级起句点；超过 12 分钟的章自动二次切 |
 | 画面源 | `playurl fnval=16` 取 **DASH 视频轨**（不含音轨，体积最小）；`--quality 64`=720P / `32`=480P，未登录通常只给 480P |
 | 抽帧 | PyAV 直接 `seek+解码单帧`（**0.04–0.09 秒/帧**），不预压缩整片、不依赖 ffmpeg CLI/cv2/skimage |
@@ -327,8 +354,9 @@ python -m src.bili_notes BV1hbM9zrEwD --pages 1-17     # 批量末尾自动体�
 覆盖度 100% 通过），体检亲和度 **0.270**，其余 16P 最低 0.567 —— 精准揪出。
 
 **串台的处理顺序**：① `--pages N --force` 重取（可能是接口偶发）→ ② 仍未登录/取不到就
-删掉（挪走留证）该 cid 的缓存 json，靠 whisper 兜底转写。删除前先 `mv` 到
-`extracted/.subcache/.bad/<cid>.crosstalk.json`，不要 `rm`。
+删掉（挪走留证）该 cid 的缓存 json。不要直接 `rm`，先 `mv` 到
+`extracted/.subcache/.bad/<cid>.crosstalk.json`。③ 向用户说明失败原因并询问是否允许
+Whisper；只有得到明确同意，才加 `--allow-whisper`。
 
 #### 覆盖度拦不住的第四类串台（2026-10-30 实测，BV1pYe76VEFm）
 
@@ -443,15 +471,12 @@ file_name: "P01-xxx.html"
 file_size: <精确字节数>          # 服务端据此校验上限，写错会被拒
 ```
 
-**② 传本体** —— 凭据交给 `tools/ima_put.py`，凭据走 stdin 不留 shell history：
+**② 传本体** —— 把 `create_media` 返回的临时凭证**对象**直接传给
+`tools/ima_put.py` 的 stdin。不要在聊天里展开、不要写进日志、不要落到临时 JSON 文件，
+也不要复制到 shell history。程序内部只传：
 
-```bash
-cat <<'JSON' | "/c/Program Files/Python312/python.exe" tools/ima_put.py
-{"file": "notes/<BV>_SPLIT/P01-xxx.html",
- "key": "<cos_key>",
- "cred": {"secret_id": "...", "secret_key": "...", "token": "...",
-          "bucket_name": "ima-share-kb-1258344701", "region": "ap-shanghai"}}
-JSON
+```
+{"file": "<本地 HTML 路径>", "key": "<cos_key>", "cred": <临时凭证对象>}
 ```
 
 看到 `OK <文件名> ... ETag=...` 才算成功。
@@ -534,7 +559,8 @@ header 里还必须有 `Origin: https://www.youtube.com`、`X-YouTube-Client-Nam
 却能正常拿到。所以：
 
 - 英文视频：直接取 `en` 的 `json3`，1.28MB / 3000+ 条，秒下；
-- 中文视频：`zh-Hans` 大概率 429，要么等一段时间重试，要么走 whisper 转写视频音轨。
+- 中文视频：`zh-Hans` 大概率 429。先等待并重试；仍失败就询问用户是否允许 Whisper，
+  不要自动转写视频音轨。
 - 顺序上**先试人工字幕（`subtitles`），再试自动字幕（`automatic_captions`）**，
   自动字幕的专有名词错得明显更多，`source` 里必须写明。
 
@@ -566,7 +592,8 @@ python tools/notes_from_local.py --video assets/video/<slug>.mp4 \
 
 ```bash
 python tools/notes_from_local.py --video in.mp4 --subtitle in.srt --name <slug>
-# 没有字幕文件就省掉 --subtitle，自动走本地 whisper
+# 用户明确同意 Whisper 后，才可省掉 --subtitle 并额外加 --allow-whisper
+python tools/notes_from_local.py --video in.mp4 --name <slug> --allow-whisper
 ```
 
 产出与 `src.bili_notes` **完全同构**（transcript.md / frames/ / contacts/ /
@@ -739,7 +766,7 @@ python tools/cleanup.py --all --yes  # 执行
 
 - **串台字幕**：28P 里 P15 拿到英雄联盟解说、P27 拿到笔记本维修，字幕「可用」所以走不到
   转写兜底。`--audit` 亲和度 0.297 / 0.427（其余 0.57–0.73）精准揪出。
-  用新加的 **`--force-whisper`** 跳过字幕直接重转。
+  先向用户说明；用户同意后才用 **`--force-whisper`** 跳过字幕直接重转。
 - **不要主动合并**：第一版做成了 20.3 万字单文件，用户看完说「还是拆成一期一期吧」，
   全部重做。合并版还有硬伤——超 10 MB 必须压图，清晰度反而不如单篇。
   现在这是一条硬规定，见「不做合并」节。
@@ -819,7 +846,7 @@ python tools/cleanup.py --all --yes  # 执行
 | 现象 | 处理 |
 |---|---|
 | 连下 12 个分P后报「所有视频源均下载失败」 | CDN 限速，**单跑该分P即可**，别整批重来（P13 重跑 53 秒成功，51 帧） |
-| 某P亲和度 0.270、其余 0.57–0.84 | 串台。`--audit` 揪出 → `mv` 该 cid 缓存到 `.subcache/.bad/` 留证 → `--page N --force` 走 whisper |
+| 某P亲和度 0.270、其余 0.57–0.84 | 串台。`--audit` 揪出 → `mv` 该 cid 缓存到 `.subcache/.bad/` 留证 → 询问用户 → 同意后 `--page N --force-whisper --allow-whisper` |
 | `--force` 后进程被杀 / 无输出 | 前台 timeout 掐掉了 whisper（要好几分钟）。**改后台跑**，别设 60–90 秒的短超时 |
 | `md_to_html ... -o out.html` 生成一个名叫 `-o` 的文件 | 它只吃两个位置参数：`<in.md> <out.html>`，没有 `-o` |
 | HTML 打开一片坏图，但生成时没报错 | 旧版 `_img_tag` 在**图文件不存在时会静默输出外链 `<img>`**。已改为汇总告警并退出码 1；看到「有 N 张图找不到源文件」就是 figs 目录没复制全 |
@@ -848,15 +875,15 @@ python tools/cleanup.py --all --yes  # 执行
 | 有字幕按钮但 track 为 0 | 未登录，AI 字幕不下发 |
 | 日志出现「字幕轨道查询失败（网络问题，不是没字幕）」 | `x/player/v2` 偶发 404。这是网络/B站接口问题，**不要急着重新扫码**，重跑一次通常就好（实测 12:13 连续 404、12:15 同一地址 200） |
 | 转写很慢 | 先 `--probe` 确认是否真没字幕；有字幕的分P不会进转写 |
-| 字幕内容明显不是这个视频（讲别的主题/带歌词） | **串台**。`--audit` 体检确认 → `--pages N --force-whisper` 跳过字幕直接重转（首选，一条命令）；老办法是挪走该 cid 缓存让 whisper 兜底 |
+| 字幕内容明显不是这个视频（讲别的主题/带歌词） | **串台**。`--audit` 体检确认 → 询问用户 → 同意后 `--pages N --force-whisper --allow-whisper` |
 | 「所有视频源均下载失败」 | 大合集连下十几个分P后 CDN 会限速超时；单独重跑该分P即可（实测 P13 重跑一次成功） |
 | 转写报 `502 Bad Gateway` 但本地有模型 | 走了 HF 代理校验 etag。用 `HF_HUB_OFFLINE=1`，或确认 `transcribe_local` 的 `local_files_only` 生效 |
 | 字幕内容跟视频对不上 / 只覆盖前几分钟 / 覆盖到片尾之后 | B站 返回了**别的视频**的字幕对象（实测：713s 的视频给回 1203s 的LOL解说字幕 = 168%；另有长度相仿的电影解说字幕）。已内建「覆盖度区间 + AI总结交叉校验」双重检查，日志出现「字幕覆盖仅/覆盖超出/内容与该视频不符，弃用该轨道」属正常自愈，无需干预 |
 | 日志反复出现「内容与该视频不符」后回落转写 | 该 cid 的字幕在 B站 侧就是坏的（实测某 cid 5 次里 4 次 404、1 次正确）。已自动重试 3 轮，仍失败走转写是正确的，不要以为是本地 bug |
-| AI 字幕把英文术语听错 | 中文 AI 字幕对专有名词识别差（DeepSeek→"deep sick"、DeepInfer→"d info"）。技术视频引用术语需人工校对；也可 `--no-subtitle` 走 whisper 对比 |
+| AI 字幕把英文术语听错 | 中文 AI 字幕对专有名词识别差（DeepSeek→"deep sick"、DeepInfer→"d info"）。技术视频引用术语需人工校对；需要 Whisper 对比时先问用户，同意后再加 `--allow-whisper` |
 | 中途报「登录态无效」 | 会话 TTL 到期，重扫一次；长任务用 `--keep-session` 并加长 `--session-ttl`。注意：**只有 B站 明确回 -101 才会焚毁会话**，网络超时只告警不烧会话 |
 | `getaddrinfo failed` / `ProxyError` / `502` | 本机代理链路抖动。脚本会 TCP 预检 `HTTPS_PROXY` 死端口并自动切直连，3 秒后整链路再试一轮；仍失败说明代理客户端挂了，重启代理或换节点 |
-| `.env` Cookie 报 `-101` | 长期 Cookie 已过期。扫码登录，或重新从浏览器取一份写进 `.env` |
+| 登录态报 `-101` | 一次性会话已过期。重新扫码；不要从浏览器复制长期 Cookie 写进 `.env` |
 | 用户说「合成一份」，做出来却比单篇「少了很多」 | 合并只许机械拼接，不许概括精简。先看「不做合并」节——默认不该合并；确需合并时跑 `tools/merge_notes.py` + `verify_merge.py` 四维校验 |
 
 ## 自检

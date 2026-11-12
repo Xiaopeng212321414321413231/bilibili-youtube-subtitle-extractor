@@ -581,17 +581,26 @@ def resolve_credentials(
     """按策略拿到一份可用凭证。
 
     login:
-        auto    本地一次性会话 → .env（若有效）→ 扫码
+        auto    本地一次性会话 → 扫码
         session 只用本地一次性会话，没有就失败
-        env     只用 .env 里的长期 Cookie（不推荐）
         qr      强制重新扫码
+        env     已移除；为避免长期凭证明文落盘，直接拒绝
 
     Returns:
-        {"creds": {...}, "source": "qr|env", "ephemeral": bool, "ttl": int}
+        {"creds": {...}, "source": "qr", "ephemeral": bool, "ttl": int}
     """
     def say(msg: str) -> None:
         if verbose:
             print(msg, flush=True)
+
+    if login == "env":
+        return {
+            "creds": {},
+            "source": "none",
+            "ephemeral": False,
+            "ttl": 0,
+            "error": "长期 Cookie 登录入口已移除；请使用手机扫码的一次性会话",
+        }
 
     if login in ("auto", "session"):
         sess = load_session()
@@ -608,27 +617,6 @@ def resolve_credentials(
                         "ttl": remaining_ttl(), "uname": "未校验"}
             say("[auth] 本地会话已失效，已焚毁")
             wipe_session()
-
-    if login in ("auto", "env") and env_file:
-        env = _read_env(env_file)
-        creds = {
-            "sessdata": env.get("BILIBILI_SESSDATA", ""),
-            "bili_jct": env.get("BILIBILI_BILI_JCT", ""),
-            "dedeuserid": env.get("BILIBILI_DEDE_USER_ID", ""),
-        }
-        if creds["sessdata"]:
-            state, who = whoami_state(creds)
-            if state == "ok":
-                say(f"[auth] 使用 .env 长期 Cookie：{who}（提示：这是长期凭证，建议改用扫码）")
-                return {"creds": creds, "source": "env", "ephemeral": False, "ttl": 0, "uname": who}
-            if state == "unknown":
-                say(f"[auth] .env Cookie 校验未完成（网络问题，继续尝试）：{who}")
-                return {"creds": creds, "source": "env", "ephemeral": False, "ttl": 0, "uname": "未校验"}
-            say(f"[auth] .env Cookie 已失效（{who}），需要重新登录")
-
-    if login == "env":
-        return {"creds": {}, "source": "none", "ephemeral": False, "ttl": 0,
-                "error": ".env 中没有可用的 BILIBILI_SESSDATA"}
 
     if login == "session":
         return {"creds": {}, "source": "none", "ephemeral": False, "ttl": 0,
@@ -663,24 +651,6 @@ def destroy(creds: Optional[dict] = None, do_revoke: bool = True) -> None:
             print("[auth]    或直接在手机 B站 App「设置 → 退出登录」立即作废全部会话。", flush=True)
     wipe_session()
     print("[auth] 本地会话已焚毁", flush=True)
-
-
-def _read_env(path: str) -> dict:
-    if not path or not os.path.exists(path):
-        return {}
-    try:
-        from dotenv import dotenv_values  # type: ignore
-
-        return {k: v for k, v in dotenv_values(path).items() if v}
-    except Exception:  # noqa: BLE001
-        out = {}
-        with open(path, encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith("#") and "=" in line:
-                    k, _, v = line.partition("=")
-                    out[k.strip()] = v.strip().strip('"').strip("'")
-        return out
 
 
 # --------------------------------------------------------------------------- #

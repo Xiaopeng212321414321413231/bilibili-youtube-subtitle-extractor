@@ -34,7 +34,7 @@ jobs:
       - name: 语法检查（不依赖测试数据）
         run: python -m compileall -q src tools extract_bilibili.py selftest_subtitle.py
 
-      - name: 离线自检（75 项）
+      - name: 离线自检（92 项）
         run: python selftest_subtitle.py
         # 纯离线，不联网、不读 .env、不写用户目录
 

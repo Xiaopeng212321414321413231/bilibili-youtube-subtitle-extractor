@@ -2,9 +2,9 @@
 
 三条设计原则
 ------------
-1. **文本永远先试 B站 字幕**：命中缓存的 P02 只要 1.8 秒，术语还比 ASR 准；
-   只有字幕不可用（无轨道 / 未登录 / 充电专属）才下载音轨做本地转写。
-   顺序不能反：转写 4 分钟起步，而字幕往往几百毫秒。
+1. **文本永远先试 B站 字幕**：官方 CC 与 B站 AI 字幕都自动尝试；命中缓存的
+   P02 只要 1.8 秒，术语还比 ASR 准。字幕连续三次失败后先停下并请用户授权，
+   默认不下载音轨、不启动 Whisper。
 2. **画面按章节分批取**：取完一章立刻落盘（frames.json 增量写），长视频可以中断续跑；
    字幕拿不到时也能先转写再抽帧，两条链路互不阻塞。
 3. **不调用任何 LLM/VLM API**：分章靠统计（词汇衔接 + 话语标记），选图与成文交给人/agent。
@@ -167,10 +167,13 @@ def transcribe_audio(audio: str, model_name: str = "small") -> dict:
             "language": getattr(info, "language", "zh"), "cached": False}
 
 
-def get_transcript(client, bvid: str, cid: int, duration: int, allow_whisper: bool = True,
+def get_transcript(client, bvid: str, cid: int, duration: int, allow_whisper: bool = False,
                    model: str = "small", lang: str = "zh", force: bool = False,
                    force_whisper: bool = False) -> dict:
-    """先取字幕；不可用且允许时才转写。返回值统一成 {source, segments, chars, cost}。
+    """先取字幕；不可用且用户已授权时才转写。返回 {source, segments, chars, cost}。
+
+    默认 ``allow_whisper=False``：字幕连续三次失败后只抛 ``PermissionError``，
+    绝不自行下载音频。用户确认后，调用方必须显式传 ``allow_whisper=True``。
 
     force_whisper=True 时跳过字幕直接转写。这是给「串台字幕」准备的出口：
     有些分P的字幕接口能返回内容，但返回的是**别的视频的字幕**（实测同一合集里
@@ -201,7 +204,10 @@ def get_transcript(client, bvid: str, cid: int, duration: int, allow_whisper: bo
     reason = r.get("reason", "unknown")
     log.warning("字幕不可用（%s：%s）", reason, (r.get("message") or "")[:100])
     if not allow_whisper:
-        raise SystemExit(f"字幕不可用且已禁用转写：{reason}")
+        raise PermissionError(
+            "字幕连续尝试三次仍不可用。启用 Whisper 前必须先获得用户授权；"
+            f"确认后请使用 --allow-whisper（原因：{reason}）"
+        )
     log.info("转入本地转写兜底（模型 %s，长视频可能需要数分钟）…", model)
     t = transcribe_local(bvid, cid, model)
     t["fallback_reason"] = reason
@@ -497,7 +503,7 @@ def parse_pages(spec: str) -> list[int]:
     return out
 
 
-def main(argv: list[str] | None = None) -> int:
+def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         prog="python -m src.bili_notes",
         description="B站视频 -> 图文笔记素材包（字幕优先、分批抽帧、不调 API）")
@@ -512,7 +518,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--frames", type=int, default=6, help="每章候选帧数（默认 6）")
     ap.add_argument("--quality", type=int, default=64, help="清晰度上限：64=720P 32=480P（默认 64）")
     ap.add_argument("--cols", type=int, default=5, help="联系表每行格数（默认 5）")
-    ap.add_argument("--no-whisper", action="store_true", help="字幕不可用时直接报错，不转写")
+    whisper_group = ap.add_mutually_exclusive_group()
+    whisper_group.add_argument("--allow-whisper", action="store_true",
+                               help="用户已明确授权：字幕连续三次失败后允许本地 Whisper 转写")
+    whisper_group.add_argument("--no-whisper", action="store_true",
+                               help="兼容旧命令；现在默认就不转写，无需再加")
     ap.add_argument("--model", default="small", help="转写模型 base/small/medium（默认 small）")
     ap.add_argument("--force", action="store_true", help="忽略字幕缓存")
     ap.add_argument("--force-whisper", action="store_true",
@@ -520,6 +530,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--audit", action="store_true",
                     help="合集内一致性体检（对比各分P词汇分布，揪出串台字幕）")
     ap.add_argument("--debug", action="store_true")
+    return ap
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = build_parser()
     args = ap.parse_args(argv)
 
     logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO,
@@ -541,6 +556,7 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
     summary = []
+    consent_needed = False
     for i, pno in enumerate(pages, 1):
         if not single:
             log.info("\n===== [%d/%d] 第 %d P =====", i, len(pages), pno)
@@ -549,6 +565,11 @@ def main(argv: list[str] | None = None) -> int:
         except SystemExit as e:
             log.error("第 %d P 跳过：%s", pno, e)
             summary.append({"page": pno, "error": str(e)})
+        except PermissionError as e:
+            consent_needed = True
+            log.warning("第 %d P 等待用户授权 Whisper：%s", pno, e)
+            summary.append({"page": pno, "error": str(e),
+                            "status": "needs_whisper_consent"})
         except Exception as e:  # noqa: BLE001
             log.error("第 %d P 失败：%s", pno, str(e)[:160])
             summary.append({"page": pno, "error": str(e)[:160]})
@@ -575,6 +596,9 @@ def main(argv: list[str] | None = None) -> int:
             _print_audit(audit_collection(_sub_client(), bvid, all_pages))
         except Exception as e:  # noqa: BLE001
             log.debug("合集体检跳过: %s", e)
+    if consent_needed:
+        log.warning("字幕失败的分P已停止。征得用户同意后，加 --allow-whisper 续跑。")
+        return 3
     return 0
 
 
@@ -672,7 +696,8 @@ def _run(args, page_no: int, out_override: str = "") -> dict:
 
     # 1) 文本：字幕优先，转写兜底
     tr = get_transcript(client, bvid, cid, duration,
-                        allow_whisper=not args.no_whisper, model=args.model,
+                        allow_whisper=bool(args.allow_whisper or args.force_whisper),
+                        model=args.model,
                         force=args.force, force_whisper=args.force_whisper)
 
     # 2) 分章

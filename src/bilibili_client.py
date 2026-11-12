@@ -11,11 +11,6 @@ import tempfile
 import time
 from typing import Optional
 
-from dotenv import load_dotenv
-
-load_dotenv()
-
-
 logger = logging.getLogger(__name__)
 
 # 默认下载目录（临时目录下的 bilibili_audio）
@@ -107,7 +102,7 @@ def download_audio(bvid: str, cid: int = 0) -> str:
 def _sub_client():
     """惰性构造字幕客户端（复用连接、WBI 缓存与磁盘缓存）。
 
-    凭证优先级：一次性扫码会话（临时文件）→ .env 长期 Cookie。
+    只使用一次性扫码会话（临时文件，到期自动焚毁），不读取长期 Cookie。
     """
     global _SUB_CLIENT
     if _SUB_CLIENT is None:
@@ -119,9 +114,8 @@ def _sub_client():
             from bili_subtitle import BiliSubtitleClient
 
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        _SUB_CLIENT = BiliSubtitleClient.from_env(
-            os.path.join(root, ".env"),
-            cache_dir=os.path.join(root, "extracted", ".subcache"),
+        _SUB_CLIENT = BiliSubtitleClient(
+            cache_dir=os.path.join(root, "extracted", ".subcache")
         )
         sess = load_session()
         if sess:

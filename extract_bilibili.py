@@ -4,14 +4,16 @@
 策略（效率优先）：
     1. 先探测每个分P 的字幕轨道（player/wbi/v2）；
     2. 有字幕 → 直接抓字幕 JSON，几秒完成，**不下载音频**；
-    3. 无字幕 → 才降级：串行下载音频（避开 CDN 限流）+ 多进程 faster-whisper 转写。
+    3. 字幕连续三次失败 → 先写待授权状态并停止；用户明确同意后才加
+       --allow-whisper，串行下载音频 + 多进程 faster-whisper 转写。
+    4. 官方 CC 与 B站 AI 字幕都允许自动提取。
 
 用法：
     python extract_bilibili.py BV1xxxxxx                    # 单视频/全部分P
     python extract_bilibili.py BV1xxxxxx --probe            # 只看字幕可用性，不取内容
     python extract_bilibili.py BV1xxxxxx --pages 1-10,15    # 指定分P
-    python extract_bilibili.py BV1xx BV2yy --no-whisper     # 只取字幕，无字幕就跳过
-    python extract_bilibili.py BV1xx --srt --model small --workers 3
+    python extract_bilibili.py BV1xx BV2yy                  # 三次失败后停下等授权
+    python extract_bilibili.py BV1xx --allow-whisper        # 仅用户同意后使用
 
 输出：
     extracted/<BV>.txt / <BV>_P<nn>.txt     正文（有字幕时来源标注 官方字幕/AI字幕）
@@ -221,7 +223,7 @@ def process(bvid: str, client: BiliSubtitleClient, args, login_ok: bool = True) 
         log.warning("点赞 %s < %d，按规则跳过（--ignore-like-filter 可强制处理）", stat["like"], MIN_LIKE)
         summary["skipped"] = "like_too_low"
         return summary
-    if view["charge_exclusive"] and not args.no_whisper:
+    if view["charge_exclusive"] and not args.allow_whisper:
         log.warning("充电专属视频：字幕不可取，音频需已充电账号，跳过")
         summary["skipped"] = "charge_exclusive"
         return summary
@@ -263,12 +265,10 @@ def process(bvid: str, client: BiliSubtitleClient, args, login_ok: bool = True) 
     rows.sort(key=lambda r: r["page"])
 
     with_sub = [r for r in rows if r["has_sub"]]
-    no_sub = [r for r in rows if not r["has_sub"]]
-    log.info("字幕可用 %d/%d（官方CC %d / AI %d），需转写 %d",
+    log.info("轨道预探测可见 %d/%d（官方CC %d / AI %d）；接下来每个分P完整尝试三次",
              len(with_sub), len(rows),
              sum(1 for r in with_sub if r["kind"] == "cc"),
-             sum(1 for r in with_sub if r["kind"] == "ai"),
-             len(no_sub))
+             sum(1 for r in with_sub if r["kind"] == "ai"))
 
     if args.probe:
         for r in rows:
@@ -279,7 +279,7 @@ def process(bvid: str, client: BiliSubtitleClient, args, login_ok: bool = True) 
 
     # ---------- 阶段 1：抓字幕内容 ----------
     texts: dict[int, dict] = {}
-    if args.prefer_subtitle and with_sub:
+    if args.prefer_subtitle and rows:
         log.info("抓取字幕内容 ...")
         t0 = time.time()
 
@@ -289,11 +289,11 @@ def process(bvid: str, client: BiliSubtitleClient, args, login_ok: bool = True) 
                                    duration=r.get("duration") or 0,
                                    verify_summary=args.verify_summary)
 
-        if len(with_sub) > 1 and args.probe_workers > 1:
+        if len(rows) > 1 and args.probe_workers > 1:
             with ThreadPoolExecutor(max_workers=args.probe_workers) as pool:
-                results = list(pool.map(fetch_one, with_sub))
+                results = list(pool.map(fetch_one, rows))
         else:
-            results = [fetch_one(r) for r in with_sub]
+            results = [fetch_one(r) for r in rows]
 
         for r, res in results:
             if res.get("available"):
@@ -308,15 +308,16 @@ def process(bvid: str, client: BiliSubtitleClient, args, login_ok: bool = True) 
             else:
                 r["has_sub"] = False
                 r["sub_error"] = res.get("message", "")
+                r["sub_attempts"] = res.get("attempts", 0)
                 if res.get("reason") == "coverage_bad":
                     log.warning(
-                        "P%s 字幕覆盖度与分P时长不符，判定为可疑字幕（可能是别的视频的），改走转写：%s",
+                        "P%s 字幕覆盖度与分P时长不符，判定为可疑字幕（可能是别的视频的）：%s",
                         r["page"],
                         res.get("message", "")[:160],
                     )
                 elif res.get("reason") == "content_suspect":
                     log.warning(
-                        "P%s 字幕内容与该视频不符（长度对得上但讲的是别的），判定串台，改走转写：%s",
+                        "P%s 字幕内容与该视频不符（长度对得上但讲的是别的），判定串台：%s",
                         r["page"],
                         res.get("message", "")[:160],
                     )
@@ -329,18 +330,15 @@ def process(bvid: str, client: BiliSubtitleClient, args, login_ok: bool = True) 
 
     # ---------- 阶段 2：缺口走 whisper ----------
     need = [r for r in rows if r["page"] not in texts]
-    if need and not texts and not login_ok and not args.no_whisper:
+    pending_whisper: list[dict] = []
+    summary["pending_whisper"] = pending_whisper
+    if need and not texts and not login_ok and not args.allow_whisper:
         log.warning("全部 %d 个分P 都探测不到字幕，且登录态无效 —— 大概率是 SESSDATA 过期导致 AI 字幕不可见。", len(rows))
-        log.warning("建议先刷新 Cookie 再跑（否则将进入慢速转写）：--require-subtitle 可直接中止")
-    if need and not args.no_whisper and args.require_subtitle:
+        log.warning("请先重新扫码；字幕连续三次失败后不会自动进入 Whisper")
+    if need and args.require_subtitle:
         log.error("--require-subtitle 已启用且存在无字幕分P，中止：%s", [r["page"] for r in need][:10])
         summary["aborted"] = "require_subtitle"
-        summary["pages"] = rows
-        return summary
-    if need and not args.no_whisper:
-        if not client.has_login:
-            log.warning("未登录状态下部分 AI 字幕取不到；在 .env 配 BILIBILI_SESSDATA 可显著提升命中率")
-
+    if need and args.allow_whisper and not summary.get("aborted"):
         log.info("需转写 %d 个分P：先串行下载音频（避开 CDN 限流）", len(need))
         from bilibili_client import download_audio
 
@@ -367,6 +365,28 @@ def process(bvid: str, client: BiliSubtitleClient, args, login_ok: bool = True) 
                         "chars": len(txt),
                         "cached": False,
                     }
+    elif need and not summary.get("aborted"):
+        for r in need:
+            pending_whisper.append({
+                "page": r["page"],
+                "part": r.get("part", ""),
+                "attempts": r.get("sub_attempts", 0),
+                "reason": r.get("sub_error") or "字幕不可用",
+            })
+        if pending_whisper and not args.no_whisper:
+            pages_text = ", ".join(f"P{x['page']}" for x in pending_whisper[:12])
+            if len(pending_whisper) > 12:
+                pages_text += f" 等 {len(pending_whisper)} 个分P"
+            summary["status"] = "needs_whisper_consent"
+            summary["whisper_resume_hint"] = (
+                "先向用户询问是否使用 Whisper；用户明确同意后，再用 "
+                "--allow-whisper 重跑这些分P。"
+            )
+            log.warning(
+                "以下分P已连续尝试字幕三次仍失败：%s。"
+                "Whisper 未启动，正在等待用户授权。",
+                pages_text,
+            )
     elif need:
         for r in need:
             r.setdefault("sub_error", "无字幕，且 --no-whisper 已禁用转写")
@@ -395,7 +415,8 @@ def process(bvid: str, client: BiliSubtitleClient, args, login_ok: bool = True) 
             page=str(r["page"]),
             skip_existing=args.skip_existing,
             force=args.force,
-            no_whisper=args.no_whisper,
+            allow_whisper=from_whisper,
+            no_whisper=False,
             model=args.model,
             chapters="",
             auto_n=0,
@@ -422,23 +443,33 @@ def process(bvid: str, client: BiliSubtitleClient, args, login_ok: bool = True) 
 
     summary["ok"] = ok
     summary["failed_pages"] = fail
+    if summary.get("aborted"):
+        summary["status"] = "aborted"
+    elif summary.get("status") != "needs_whisper_consent":
+        summary["status"] = "partial" if fail else "completed"
     with open(os.path.join(OUT_DIR, f"{bvid}.json"), "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
 
     log.info("完成 %d/%d，图文素材在 notes/", ok, len(rows))
     if fail:
         log.warning("失败分P: %s", fail)
+    if summary.get("status") == "needs_whisper_consent":
+        log.warning("已先完成可处理分P；剩余分P等待用户决定是否使用 Whisper")
     return summary
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         description="B站视频 → 图文笔记素材（字幕 + 关键帧，缺一不出）。"
                     "默认下载原视频抽帧，再结合字幕，产物是 notes/<BV>_P<NN>/")
     ap.add_argument("bvids", nargs="*", help="BV号 或 https://www.bilibili.com/video/BVxxx 链接")
     ap.add_argument("--pages", default="", help="分P范围，如 1-10,15")
     ap.add_argument("--probe", action="store_true", help="只探测字幕可用性，不抓内容、不转写")
-    ap.add_argument("--no-whisper", action="store_true", help="无字幕时直接跳过，不下载音频转写")
+    whisper_group = ap.add_mutually_exclusive_group()
+    whisper_group.add_argument("--allow-whisper", action="store_true",
+                               help="用户已明确授权：字幕连续三次失败后允许本地 Whisper 转写")
+    whisper_group.add_argument("--no-whisper", action="store_true",
+                               help="兼容旧命令；现在默认就不转写，无需再加")
     ap.add_argument("--no-verify", dest="verify_summary", action="store_false",
                     help="跳过「字幕内容 vs 视频AI总结」交叉校验（默认开启，防串台）")
     ap.add_argument("--prefer-subtitle", dest="prefer_subtitle", action="store_true", default=True)
@@ -458,13 +489,18 @@ def main() -> None:
     ap.add_argument("--check", action="store_true", help="自检：登录态 / WBI 签名 / 字幕接口连通性")
     ap.add_argument("--debug", action="store_true", help="输出调试日志（含每次请求/重试/校验细节）")
     ap.add_argument("--log-file", default="", help="把完整日志另存到文件（便于事后定位）")
-    ap.add_argument("--login", choices=["auto", "session", "env", "qr", "none"], default="auto",
-                    help="auto=会话→.env→扫码；session=只用一次性会话；env=只用.env；qr=强制扫码；none=匿名")
+    ap.add_argument("--login", choices=["auto", "session", "qr", "none"], default="auto",
+                    help="auto=一次性会话→扫码；session=只用一次性会话；qr=强制扫码；none=匿名")
     ap.add_argument("--keep-session", action="store_true", help="任务结束不注销会话（默认用完即焚）")
     ap.add_argument("--logout", action="store_true", help="只注销并焚毁当前一次性会话")
     ap.add_argument("--qr-out", default="", help="登录二维码 PNG 输出路径")
     ap.add_argument("--session-ttl", type=int, default=1800, help="扫码会话有效期秒数（默认 1800）")
     ap.add_argument("--qr-timeout", type=int, default=180, help="等待扫码秒数（默认 180）")
+    return ap
+
+
+def main() -> None:
+    ap = build_parser()
     args = ap.parse_args()
 
     # 调试日志：--debug 打细节，--log-file 把完整日志落盘（便于事后定位串台）
@@ -491,7 +527,6 @@ def main() -> None:
     auth = {"creds": {}, "source": "none", "ephemeral": False, "ttl": 0}
     if args.login != "none":
         auth = resolve_credentials(
-            env_file=os.path.join(BASE, ".env"),
             login=args.login,
             qr_out=args.qr_out,
             ttl=args.session_ttl,
@@ -512,10 +547,10 @@ def main() -> None:
                  "（一次性会话，任务结束自动注销）" if auth.get("ephemeral") else "")
 
     if args.check:
-        print(f"  .env 路径      : {os.path.join(BASE, '.env')}")
         print(f"  认证来源       : {auth.get('source')} {'(一次性)' if auth.get('ephemeral') else ''}")
         print(f"  登录校验       : {'✓ ' + who if ok else '✗ ' + who}")
         print(f"  会话剩余       : {auth.get('ttl', 0) // 60} 分钟")
+        print("  凭证策略       : 仅一次性扫码会话；不读取 .env Cookie")
         print(f"  字幕缓存目录   : {CACHE_DIR}")
         print(f"  whisper 模型   : {args.model}（{MODEL_DIR}）")
         if auth.get("ephemeral") and not args.keep_session:
@@ -531,6 +566,7 @@ def main() -> None:
     if args.probe:
         log.info("提示：--probe 结束后仍会注销一次性会话，避免重复扫码请加 --keep-session")
 
+    wait_for_consent = False
     try:
         for raw in args.bvids:
             bvid = raw.strip().split("/video/")[-1].split("/")[0].split("?")[0]
@@ -538,14 +574,21 @@ def main() -> None:
                 log.error("无法识别 BV 号: %s", raw)
                 continue
             try:
-                process(bvid, client, args, login_ok=ok)
+                summary = process(bvid, client, args, login_ok=ok)
+                wait_for_consent = wait_for_consent or (
+                    summary.get("status") == "needs_whisper_consent"
+                )
             except KeyboardInterrupt:
                 log.warning("已中断")
                 break
             except Exception as e:  # noqa: BLE001
                 log.error("%s 处理失败: %s", bvid, e)
     finally:
-        if auth.get("ephemeral") and not args.keep_session:
+        if auth.get("ephemeral") and wait_for_consent:
+            log.info(
+                "一次性会话暂留到用户答复或 TTL 到期；同意 Whisper 后可直接续跑"
+            )
+        elif auth.get("ephemeral") and not args.keep_session:
             destroy_session(auth["creds"])
         elif auth.get("ephemeral"):
             log.info("已保留一次性会话（--keep-session），记得稍后 --logout")

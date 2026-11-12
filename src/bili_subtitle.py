@@ -14,7 +14,7 @@
   5. 并发探测多分P，避免 60P 课程串行等 1 分钟。
 
 对外接口：
-    client = BiliSubtitleClient.from_env()
+    client = BiliSubtitleClient()
     view   = client.get_view("BV1xx")            # 元信息 + pages
     result = client.fetch("BV1xx", cid=123)      # 单分P字幕（含缓存）
     rows   = client.probe("BV1xx")               # 全部分P字幕可用性探测
@@ -270,31 +270,6 @@ class BiliSubtitleClient:
                 self.s.cookies.set(real, val, domain=".bilibili.com")
         self.has_login = bool((creds or {}).get("sessdata"))
         self._view_cache.clear()
-
-    @classmethod
-    def from_env(cls, env_file: Optional[str] = None, **kw) -> "BiliSubtitleClient":
-        """从 .env 读取 BILIBILI_SESSDATA / BILIBILI_BILI_JCT / BILIBILI_DEDE_USER_ID。"""
-        env: dict[str, str] = {}
-        if env_file and os.path.exists(env_file):
-            try:
-                from dotenv import dotenv_values  # type: ignore
-
-                env = {k: v for k, v in dotenv_values(env_file).items() if v}
-            except Exception:  # dotenv 缺失时退回手工解析
-                with open(env_file, encoding="utf-8") as f:
-                    for line in f:
-                        line = line.strip()
-                        if not line or line.startswith("#") or "=" not in line:
-                            continue
-                        k, v = line.split("=", 1)
-                        env[k.strip()] = v.strip().strip('"').strip("'")
-        get = lambda k: env.get(k) or os.environ.get(k, "")
-        return cls(
-            sessdata=get("BILIBILI_SESSDATA"),
-            bili_jct=get("BILIBILI_BILI_JCT"),
-            dedeuserid=get("BILIBILI_DEDE_USER_ID"),
-            **kw,
-        )
 
     # ---------------- 底层请求 ----------------
     def _mixin(self) -> str:
@@ -675,24 +650,10 @@ class BiliSubtitleClient:
                             pass
                     else:
                         cached["cached"] = True
+                        cached["attempts"] = 0
                         return cached
             except Exception:  # noqa: BLE001
                 pass
-
-        try:
-            tracks = self.list_tracks(aid, cid, bvid, raise_on_error=True)
-        except RiskyBanned:
-            raise
-        except Exception as e:  # noqa: BLE001
-            # 请求挂了 ≠ 没字幕，别误导用户去重新扫码
-            return {
-                "available": False,
-                "reason": "track_error",
-                "message": f"字幕轨道查询失败（网络/接口异常，非无字幕）：{str(e)[:160]}",
-            }
-        if not tracks:
-            hint = "（未登录，AI 字幕通常需要登录态 SESSDATA）" if not self.has_login else ""
-            return {"available": False, "reason": "no_track", "message": f"该分P无字幕轨道{hint}"}
 
         # 按优先级逐个尝试，第一个能抓到内容的胜出
         def _ordered(ts: list[dict]) -> list[dict]:
@@ -789,28 +750,50 @@ class BiliSubtitleClient:
             return None, errs
 
         errors: list[str] = []
+        saw_track = False
         for attempt in range(self.MAX_TRACK_ATTEMPTS):
             if attempt:
                 # B站 偶发下发「别的视频」的字幕对象，重查一次轨道通常就能拿到正确的。
                 # 重试间隔按用户指定的节奏递增：第一次重试前等 1.5s，第二次前等 3s；
-                # 两轮重试仍失败才交回调用方走本地转写。
+                # 三次都失败才交回调用方，由调用方先向用户申请 Whisper 授权。
                 wait = 1.5 if attempt == 1 else 3.0
-                log.info("字幕提取失败，等 %ss 后重查轨道再试（第 %d/%d 次）…",
-                         wait, attempt, self.MAX_TRACK_ATTEMPTS - 1)
+                log.info("字幕提取失败，等 %ss 后完整重试（第 %d/%d 次）…",
+                         wait, attempt + 1, self.MAX_TRACK_ATTEMPTS)
                 time.sleep(wait)
-                try:
-                    again = self.list_tracks(aid, cid, bvid, raise_on_error=True)
-                except Exception as e:  # noqa: BLE001
-                    errors.append(f"重查轨道失败: {e}")
-                    break
-                if not again:
-                    errors.append("重查后仍无轨道")
-                    break
-                tracks = again
+
+            try:
+                tracks = self.list_tracks(aid, cid, bvid, raise_on_error=True)
+            except RiskyBanned:
+                raise
+            except Exception as e:  # noqa: BLE001
+                # 请求挂了 ≠ 没字幕；仍要做满三次，网络抖动可能自行恢复。
+                errors.append(f"第 {attempt + 1} 次查询轨道失败: {str(e)[:120]}")
+                continue
+
+            if not tracks:
+                errors.append(f"第 {attempt + 1} 次未找到字幕轨道")
+                continue
+
+            saw_track = True
             got, errs = _try(_ordered(tracks))
             errors.extend(errs)
             if got:
+                got["attempts"] = attempt + 1
                 return got
+
+        hint = "（未登录，AI 字幕通常需要登录态）" if not self.has_login else ""
+        if not saw_track:
+            request_failed = any("查询轨道失败" in e for e in errors)
+            return {
+                "available": False,
+                "reason": "track_error" if request_failed else "no_track",
+                "attempts": self.MAX_TRACK_ATTEMPTS,
+                "message": (
+                    f"连续 {self.MAX_TRACK_ATTEMPTS} 次查询字幕轨道失败："
+                    if request_failed
+                    else f"连续 {self.MAX_TRACK_ATTEMPTS} 次未找到字幕轨道{hint}："
+                ) + "; ".join(errors[-3:]),
+            }
 
         off_cov = [e for e in errors if "覆盖仅" in e or "覆盖超出" in e]
         mismatch = [e for e in errors if "内容与该视频不符" in e]
@@ -823,6 +806,7 @@ class BiliSubtitleClient:
         return {
             "available": False,
             "reason": reason,
+            "attempts": self.MAX_TRACK_ATTEMPTS,
             "message": "字幕轨道存在但内容不可用：" + "; ".join(errors[:4]),
         }
 

@@ -13,7 +13,8 @@
     python tools/notes_from_local.py --video in.mp4 --subtitle in.srt --name xxx
     python tools/notes_from_local.py --video in.mp4 --audio-only   # 手上有音轨就省解码
 
-字幕给了就用字幕（快、准），没给就本地 whisper 转写。srt / vtt 都吃。
+字幕给了就用字幕（快、准）。没有字幕时必须由用户明确同意后才运行 Whisper；
+默认只报错，不会自行转写。srt / vtt 都吃。
 """
 from __future__ import annotations
 
@@ -73,6 +74,11 @@ def build(args) -> dict:
         tr = {"source": "字幕文件（%s）" % os.path.splitext(args.subtitle)[1].lstrip("."),
               "segments": segs, "chars": sum(len(s["text"]) for s in segs), "cost": 0}
         log.info("字幕：%d 段 / %d 字", len(segs), tr["chars"])
+    elif not args.allow_whisper:
+        raise PermissionError(
+            "没有可用字幕。启用 Whisper 前必须先获得用户授权；"
+            "确认后请加 --allow-whisper"
+        )
     elif args.audio_only and args.audio:
         tr = transcribe_audio(os.path.abspath(args.audio), args.model)
         log.info("转写：%d 段 / %d 字", len(tr["segments"]), tr["chars"])
@@ -156,7 +162,9 @@ def build(args) -> dict:
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="从本地视频 + 字幕生成图文素材")
     ap.add_argument("--video", required=True, help="本地视频文件（mp4/mkv/webm 均可）")
-    ap.add_argument("--subtitle", default="", help="字幕文件（srt/vtt），有就用，没有则转写")
+    ap.add_argument("--subtitle", default="", help="字幕文件（srt/vtt）")
+    ap.add_argument("--allow-whisper", action="store_true",
+                    help="用户已明确授权：没有字幕时允许本地 Whisper 转写")
     ap.add_argument("--audio", default="", help="单独的音频文件（配合 --audio-only）")
     ap.add_argument("--audio-only", action="store_true", help="只转写 --audio 指定的音频")
     ap.add_argument("--name", required=True, help="输出目录名（notes/<name>/）")
